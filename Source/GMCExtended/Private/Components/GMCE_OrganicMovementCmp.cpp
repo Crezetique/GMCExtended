@@ -2,9 +2,11 @@
 
 #include "GMCExtendedLog.h"
 #include "GMCE_TrackedCurveProvider.h"
+#include "GMCPawn.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Support/GMCE_UtilityLibrary.h"
+#include "Replication/Compression.h"
 
 #define TURN_IN_PLACE_ENDPOINT 5.f
 
@@ -58,58 +60,86 @@ void UGMCE_OrganicMovementCmp::TickComponent(float DeltaTime, ELevelTick TickTyp
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	if (bResetMesh)
+	// UpdateAllPredictions(DeltaTime);
+	
+	// Ragdoll nonsense.
+	if (bResetMesh && IsValid(SkeletalMesh))
 	{
 		UPrimitiveComponent* CollisionComponent = Cast<UPrimitiveComponent>(UpdatedComponent);
 		if (IsValid(CollisionComponent))
 		{
 			CollisionComponent->SetCollisionEnabled(ECollisionEnabled::Type::QueryAndPhysics);
 			SetRootCollisionHalfHeight(PreviousCollisionHalfHeight, true, false);
+			if (IsRemotelyControlledListenServerPawn())
+			{
+				SV_SwapServerState();
+				CollisionComponent->SetCollisionEnabled(ECollisionEnabled::Type::QueryAndPhysics);
+				SetRootCollisionHalfHeight(PreviousCollisionHalfHeight, true, false);
+				SV_SwapServerState();
+			}
 		}
 
 		SkeletalMesh->SetAllBodiesSimulatePhysics(false);
 		SkeletalMesh->ResetAllBodiesSimulatePhysics();
+		SkeletalMesh->SetAbsolute(false, false, false);
 		SkeletalMesh->AttachToComponent(GetPawnOwner()->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
 		SkeletalMesh->SetRelativeLocationAndRotation(PreviousRelativeMeshLocation, PreviousRelativeMeshRotation, false, nullptr, ETeleportType::ResetPhysics);
-		bResetMesh = false;
 
-		if (GetOwnerRole() == ROLE_SimulatedProxy)
-		{
-			// Re-enable smoothing on simulated proxies.
-			SetComponentToSmooth(GetSkeletalMeshReference());
-		}
-	}
-	else if (bFirstRagdollTick && GetMovementMode() == GetRagdollMode())
-	{
-		bFirstRagdollTick = false;
-
-#if ENABLE_DRAW_DEBUG || WITH_EDITORONLY_DATA
-		if (bDrawDebugPredictions)
-		{
-			const FVector InitialActor = GetLinearVelocity_GMC();
-			const FVector InitialPhysics = SkeletalMesh->GetBoneLinearVelocity(FName(TEXT("root")));
-			DrawDebugLine(GetWorld(), GetActorLocation_GMC(), GetActorLocation_GMC() + RagdollLinearVelocity, FColor::Red, false, 1.f, 0, 2.f);
-		}
-#endif
+		RagdollInitialComponentOffset = FVector::ZeroVector;
 		
-		UPrimitiveComponent* CollisionComponent = Cast<UPrimitiveComponent>(UpdatedComponent);
-		if (IsValid(CollisionComponent))
+		SetComponentToSmooth(GetSkeletalMeshReference());
+		bResetMesh = false;
+	}
+	else if (GetMovementMode() == GetRagdollMode() && IsValid(SkeletalMesh))
+	{
+		if (bFirstRagdollTick)
 		{
-			CollisionComponent->SetCollisionEnabled(ECollisionEnabled::Type::NoCollision);
-		}
-
-		if (GetOwnerRole() == ROLE_SimulatedProxy)
-		{
+			RagdollInitialComponentOffset = SkeletalMesh->GetRelativeLocation();
+			
 			// Disable smoothing on simulated proxies, since it'll just make Unreal complain.
 			SetComponentToSmooth(nullptr);
-		}
-		
-		PreviousCollisionHalfHeight = GetRootCollisionHalfHeight(true);
-		SetRootCollisionHalfHeight(0.1f, false, false);
 
-		SkeletalMesh->SetAllBodiesBelowSimulatePhysics(RagdollBoneName, true, true);
-		SkeletalMesh->SetAllBodiesBelowLinearVelocity(RagdollBoneName, RagdollLinearVelocity, true);
-		
+			SV_SwapServerState();
+			PreviousCollisionHalfHeight = GetRootCollisionHalfHeight(true);
+			SetRootCollisionHalfHeight(GetRootCollisionExtent(false).X, true, false);
+			SV_SwapServerState();
+
+			UPrimitiveComponent* CollisionComponent = Cast<UPrimitiveComponent>(UpdatedComponent);
+			if (IsValid(CollisionComponent))
+			{
+				CollisionComponent->SetCollisionEnabled(ECollisionEnabled::Type::NoCollision);
+				if (IsRemotelyControlledListenServerPawn())
+				{
+					SV_SwapServerState();
+					CollisionComponent->SetCollisionEnabled(ECollisionEnabled::Type::NoCollision);
+					SV_SwapServerState();							
+				}
+			}
+			SkeletalMesh->SetAllBodiesSimulatePhysics(true);
+			SkeletalMesh->SetAllBodiesBelowLinearVelocity(RagdollBoneName, RagdollLinearVelocity, true);
+			SkeletalMesh->SetAbsolute(true, false, false);
+
+			LastRagdollBonePosition = SkeletalMesh->GetBoneLocation(RagdollBoneName);
+			LastRagdollTime = GetWorld()->GetTime().GetRealTimeSeconds();
+
+			bFirstRagdollTick = false;
+		}
+		else if (bShouldReplicateRagdoll && !CurrentRagdollGoal.IsZero())
+		{
+			FVector PelvisLocation = SkeletalMesh->GetBoneLocation(RagdollBoneName);
+			FVector PelvisTarget = GetActorLocation_GMC();
+			PelvisTarget.Z = PelvisLocation.Z;
+			
+			const FVector BoneDelta = PelvisTarget - PelvisLocation;
+			const FVector PelvisOffset = SkeletalMesh->GetBoneLocation(RagdollBoneName) - SkeletalMesh->GetComponentLocation();
+			const FVector ComponentTarget = PelvisTarget - PelvisOffset;
+
+			if (!bRagdollStopped && BoneDelta.Length() > KINDA_SMALL_NUMBER)
+			{
+				// Figure out what needs to be done to shift the pelvis to match, if needed.
+				SkeletalMesh->SetWorldLocation(ComponentTarget, false, nullptr, ETeleportType::TeleportPhysics);
+			}
+		}
 	}
 	
 	if (bHadInput && !IsInputPresent())
@@ -118,24 +148,10 @@ void UGMCE_OrganicMovementCmp::TickComponent(float DeltaTime, ELevelTick TickTyp
 	}
 	bHadInput = IsInputPresent();
 
+	// Offset turn-in-place functionality.
 	if (GetMovementMode() == EGMC_MovementMode::Grounded)
 	{
-		if (bPrecalculateDistanceMatches)
-		{
-			UpdateStopPrediction(DeltaTime);
-			UpdatePivotPrediction(DeltaTime);
-		}
-
-		if (bTrajectoryEnabled)
-		{
-			UpdateMovementSamples();
-			if (bPrecalculateFutureTrajectory)
-			{
-				UpdateTrajectoryPrediction();
-			}
-		}
-
-		if (GetNetMode() != NM_Standalone && GetNetMode() != NM_DedicatedServer)
+		if (GetNetMode() != NM_Standalone && GetNetMode() != NM_DedicatedServer && TurnInPlaceType != EGMCE_TurnInPlaceType::None)
 		{
 			if (!FMath::IsNearlyZero(RootYawOffset, KINDA_SMALL_NUMBER) && !IsTurningInPlace())
 			{
@@ -148,18 +164,18 @@ void UGMCE_OrganicMovementCmp::TickComponent(float DeltaTime, ELevelTick TickTyp
 				RootYawOffset = FMath::Lerp(RootYawOffset, 0.f, FMath::Clamp(RootYawBlendTime * 5.f, 0.f, 1.f));
 			}
 
+			SV_SwapServerState();
 			if (!FMath::IsNearlyZero(RootYawOffset, KINDA_SMALL_NUMBER))
 			{
-				UE_LOG(LogGMCExtended, Log, TEXT("[%s] root yaw %f"), *GetNetRoleAsString(GetOwnerRole()), RootYawOffset);
 				GetSkeletalMeshReference()->SetRelativeRotation(FRotator(0.f, RootYawOffset - 90.f, 0.f));
 			}
 			else
 			{
-				GetSkeletalMeshReference()->SetRelativeRotation(FRotator(0.f, -90.f, 0.f));
+				GetSkeletalMeshReference()->SetRelativeRotation(FRotator(0.f, -90.f, 0.f), false, nullptr, ETeleportType::ResetPhysics);
 				RootYawBlendTime = 0.f;
 			}			
+			SV_SwapServerState();
 		}
-
 	}
 	else
 	{
@@ -174,25 +190,28 @@ void UGMCE_OrganicMovementCmp::TickComponent(float DeltaTime, ELevelTick TickTyp
 #endif
     }
 
+	// Debug output
 #if ENABLE_DRAW_DEBUG || WITH_EDITORONLY_DATA
-	if (IsTrajectoryDebugEnabled() && !IsNetMode(NM_DedicatedServer) && GetMovementMode() == EGMC_MovementMode::Grounded)
+	if (IsTrajectoryDebugEnabled() && !IsNetMode(NM_DedicatedServer))
 	{
+		bool bIsPredictiveMode = GetMovementMode() == EGMC_MovementMode::Airborne || GetMovementMode() == EGMC_MovementMode::Grounded;
+		
 		const FVector ActorLocation = GetActorLocation_GMC();
-		if (bTrajectoryIsStopping || (bDebugHadPreviousStop && GetLinearVelocity_GMC().IsZero()))
+		if (bIsPredictiveMode && !bDrawTrajectoryOnly && (bTrajectoryIsStopping || (bDebugHadPreviousStop && GetLinearVelocity_GMC().IsZero())))
 		{
 			if (bTrajectoryIsStopping) DebugPreviousStop = ActorLocation + PredictedStopPoint;
 			DrawDebugSphere(GetWorld(), DebugPreviousStop, 24.f, 12, bTrajectoryIsStopping ? FColor::Blue : FColor::Black, false, bTrajectoryIsStopping ? -1 : 1.f, 0, bTrajectoryIsStopping ? 1.f: 2.f);
 			bDebugHadPreviousStop = bTrajectoryIsStopping;
 		}
 		
-		if (bTrajectoryIsPivoting || (bDebugHadPreviousPivot && !DoInputAndVelocityDiffer()))
+		if (bIsPredictiveMode && !bDrawTrajectoryOnly && (bTrajectoryIsPivoting || (bDebugHadPreviousPivot && !DoInputAndVelocityDiffer())))
 		{
 			if (bTrajectoryIsPivoting) DebugPreviousPivot = ActorLocation + PredictedPivotPoint;
 			DrawDebugSphere(GetWorld(), DebugPreviousPivot, 24.f, 12, bTrajectoryIsPivoting ? FColor::Yellow : FColor::White, false, bTrajectoryIsPivoting ? -1 : 2.f, 0, bTrajectoryIsPivoting ? 1.f : 2.f);
 			bDebugHadPreviousPivot = bTrajectoryIsPivoting;
 		}
 
-		if (DoInputAndVelocityDiffer())
+		if (bIsPredictiveMode && !bDrawTrajectoryOnly && DoInputAndVelocityDiffer())
 		{
 			const FVector LinearVelocityDirection = GetLinearVelocity_GMC().GetSafeNormal();
 			const FVector AccelerationDirection = UKismetMathLibrary::RotateAngleAxis(LinearVelocityDirection, InputVelocityOffsetAngle(), FVector(0.f, 0.f, 1.f));
@@ -202,7 +221,7 @@ void UGMCE_OrganicMovementCmp::TickComponent(float DeltaTime, ELevelTick TickTyp
 		if (bTrajectoryEnabled)
 		{
 			FTransform OriginTransform;
-			if (bTrajectoryUsesMesh)
+			if (bTrajectoryUsesMesh && SkeletalMesh)
 			{
 				OriginTransform = SkeletalMesh->GetComponentTransform();
 			}
@@ -210,7 +229,16 @@ void UGMCE_OrganicMovementCmp::TickComponent(float DeltaTime, ELevelTick TickTyp
 			{
 				OriginTransform = UpdatedComponent->GetComponentTransform();
 			}
-			PredictedTrajectory.DrawDebug(GetWorld(), OriginTransform);
+
+			int PastSamples = MovementSamples.Num();
+			if (bIsPredictiveMode)
+			{
+				PredictedTrajectory.DrawDebug(GetWorld(), OriginTransform, FColor::Blue, FColor::Green, FColor::Red, PastSamples, DebugPredictionLifeTime);
+			}
+			else
+			{
+				GetMovementHistory(false).DrawDebug(GetWorld(), OriginTransform, FColor::Blue, FColor::Green, FColor::Red, PastSamples, DebugPredictionLifeTime);
+			}
 		}
 	}
 #endif
@@ -246,6 +274,17 @@ void UGMCE_OrganicMovementCmp::BindReplicationData_Implementation()
 		EGMC_InterpolationFunction::Linear
 	);
 
+	/// Vector representing our last landing impact. This is replicated so that
+	/// simulated proxies can determine whether to play 'heavy' or 'light' land
+	/// animations.
+	BI_LastLandingVelocity = BindCompressedVector(
+		LastLandingVelocity,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
 	// Bool representing whether we want to go into ragdoll mode or not.
 	BI_WantsRagdoll = BindBool(
 		bWantsRagdoll,
@@ -258,9 +297,9 @@ void UGMCE_OrganicMovementCmp::BindReplicationData_Implementation()
 	// The initial linear velocity we should launch a ragdoll at.
 	BI_RagdollLinearVelocity = BindCompressedVector(
 		RagdollLinearVelocity,
-		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_PredictionMode::ClientAuth_InputOutput,
 		EGMC_CombineMode::CombineIfUnchanged,
-		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_SimulationMode::PeriodicAndOnChange_InputOutput,
 		EGMC_InterpolationFunction::NearestNeighbour
 	);
 
@@ -286,11 +325,18 @@ void UGMCE_OrganicMovementCmp::BindReplicationData_Implementation()
 	// the ragdolling.
 	BI_CurrentRagdollGoal = BindCompressedVector(
 		CurrentRagdollGoal,
-		EGMC_PredictionMode::ServerAuth_Input_ServerValidated,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::PeriodicAndOnChange_Output,
 		EGMC_InterpolationFunction::Linear
 	);
+
+	BI_RagdollStopped = BindBool(
+		bRagdollStopped,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour);
 
 	BI_AvailableSolvers = BindGameplayTagContainer(
 		AvailableSolvers,
@@ -324,20 +370,19 @@ void UGMCE_OrganicMovementCmp::BindReplicationData_Implementation()
 		EGMC_InterpolationFunction::TargetValue
 	);
 
-	// BI_TurnInPlaceStartDirection = BindCompressedVector(
-	// 	TurnInPlaceStartDirection,
-	// 	EGMC_PredictionMode::ClientAuth_Input,
-	// 	EGMC_CombineMode::CombineIfUnchanged,
-	// 	EGMC_SimulationMode::PeriodicAndOnChange_Output,
-	// 	EGMC_InterpolationFunction::TargetValue
-	// );
-
 	BI_TurnToDirection = BindCompressedVector(
 		TurnToDirection,
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::PeriodicAndOnChange_Output,
 		EGMC_InterpolationFunction::TargetValue
+	);
+
+	BI_PreviousMontagePosition = BindSinglePrecisionFloat(PreviousMontagePosition,
+		MontageReplication.MontagePrediction.MontagePositionPredictionMode,
+		MontageReplication.MontagePrediction.MontagePositionCombineMode,
+		MontageReplication.MontageSimulation.bReplicateMontagePosition ? EGMC_SimulationMode::Periodic_Output : EGMC_SimulationMode::None,
+		MontageReplication.MontageSimulation.MontagePositionInterpolation
 	);
 
 	if (OnBindReplicationData.IsBound())
@@ -381,33 +426,35 @@ void UGMCE_OrganicMovementCmp::MovementUpdate_Implementation(float DeltaSeconds)
 {
 	Super::MovementUpdate_Implementation(DeltaSeconds);
 
-	if (!IsSimulatedProxy() || IsNetMode(NM_Standalone))
-	{
-		// If we're a locally-controlled pawn (or the server), we have data on current input.
-		bInputPresent = !GetProcessedInputVector().IsZero();
-		InputVelocityOffset = UGMCE_UtilityLibrary::GetAngleDifferenceXY(GetLinearVelocity_GMC(), GetProcessedInputVector());
-		CalculatedEffectiveAcceleration = GetTransientAcceleration();
-	}
+	// If we're a locally-controlled pawn (or the server), we have data on current input.
+	bInputPresent = !GetProcessedInputVector().IsZero();
+	InputVelocityOffset = UGMCE_UtilityLibrary::GetAngleDifferenceXY(GetLinearVelocity_GMC(), GetProcessedInputVector());
+	CalculatedEffectiveAcceleration = GetTransientAcceleration();
 }
 
 void UGMCE_OrganicMovementCmp::MovementUpdateSimulated_Implementation(float DeltaSeconds)
 {
 	Super::MovementUpdateSimulated_Implementation(DeltaSeconds);
 
-	
-	
 }
 
 void UGMCE_OrganicMovementCmp::GenSimulationTick_Implementation(float DeltaTime)
 {
 	Super::GenSimulationTick_Implementation(DeltaTime);
 
+	ProcessedInputVector = PreProcessInputVector(RawInputVector);
+	
 	// If we're being simulated, we should always synthesize an acceleration from past movements.
 	UpdateAnimationHelperValues(DeltaTime);
 	UpdateCalculatedEffectiveAcceleration();
 
-	UpdateTurnInPlaceState(true);
+	if (!IsSmoothedListenServerPawn())
+	{
+		UpdateAllPredictions(DeltaTime);
+	}
 	
+	UpdateTurnInPlaceState(true);
+
 	if (bWantsTurnInPlace && (IsTurningInPlace() || TurnInPlaceState == EGMCE_TurnInPlaceState::Starting))
 	{
 		ApplyTurnInPlace(DeltaTime, true);
@@ -417,7 +464,6 @@ void UGMCE_OrganicMovementCmp::GenSimulationTick_Implementation(float DeltaTime)
 	{
 		EndTurnInPlace(true);
 	}
-	
 }
 
 void UGMCE_OrganicMovementCmp::GenPredictionTick_Implementation(float DeltaTime)
@@ -430,6 +476,8 @@ void UGMCE_OrganicMovementCmp::GenAncillaryTick_Implementation(float DeltaTime, 
                                                                bool bCombinedClientMove)
 {
 	Super::GenAncillaryTick_Implementation(DeltaTime, bLocalMove, bCombinedClientMove);
+
+	UpdateAllPredictions(DeltaTime);
 }
 
 bool UGMCE_OrganicMovementCmp::UpdateMovementModeDynamic_Implementation(FGMC_FloorParams& Floor, float DeltaSeconds)
@@ -441,8 +489,12 @@ bool UGMCE_OrganicMovementCmp::UpdateMovementModeDynamic_Implementation(FGMC_Flo
 		{
 			RagdollLinearVelocity = GetRagdollInitialVelocity();
 			HaltMovement();
+			SetMovementMode(GetRagdollMode());
 		}
-		SetMovementMode(bWantsRagdoll ? GetRagdollMode() : EGMC_MovementMode::Grounded);
+		else if (!bWantsRagdoll)
+		{
+			SetMovementMode(EGMC_MovementMode::Airborne);
+		}
 		return true;
 	}
 
@@ -455,9 +507,8 @@ bool UGMCE_OrganicMovementCmp::UpdateMovementModeDynamic_Implementation(FGMC_Flo
 	// If we disable solver mode, we revert to airborne to allow GMC to sort things out itself.
 	if (GetMovementMode() == GetSolverMovementMode())
 	{
-		SetMovementMode(EGMC_MovementMode::Airborne);
+		LeaveSolverMode();
 	}
-	
 	
 	return Super::UpdateMovementModeDynamic_Implementation(Floor, DeltaSeconds);
 }
@@ -545,97 +596,55 @@ float UGMCE_OrganicMovementCmp::GetMaxSpeed() const
 
 void UGMCE_OrganicMovementCmp::PhysicsCustom_Implementation(float DeltaSeconds)
 {
-	if (GetMovementMode() == GetRagdollMode() && bShouldReplicateRagdoll)
+	if (GetMovementMode() == GetRagdollMode() && bShouldReplicateRagdoll && IsValid(SkeletalMesh))
 	{
+		const bool bIsBoneAuthority = IsRagdollBoneAuthority();
+		
 		const FVector BoneLocation = SkeletalMesh->GetBoneLocation(RagdollBoneName);
 		const FVector BoneVelocity = SkeletalMesh->GetBoneLinearVelocity(RagdollBoneName) * FVector(1.f, 1.f, 0.f);
 		
-		if (GetOwnerRole() == ROLE_Authority)
+		if (bIsBoneAuthority)
 		{
-			// As the server, we need to be the authority.
+			FVector BoneOffset = BoneLocation - CurrentRagdollGoal;
 			
 			// Set our goal for clients to use.
+			bRagdollStopped = BoneOffset.Length() <= 5.f;
 			CurrentRagdollGoal = BoneLocation;
 		}
-		else if (!CurrentRagdollGoal.IsZero() && !BoneVelocity.IsNearlyZero())
-		{
-			// We're a client, so figure out what needs to be done to shift the pelvis to match.
-			const FVector Delta = CurrentRagdollGoal - BoneLocation;
 
-			if (Delta.Size() > 2.f)
-			{
-				const FVector PelvisToComponent = SkeletalMesh->GetComponentLocation() - BoneLocation;
-				SkeletalMesh->MoveComponent(Delta + PelvisToComponent, SkeletalMesh->GetComponentQuat(), false, nullptr, MOVECOMP_NoFlags, ETeleportType::None);
-			}
-		}
-
-		if (!IsSimulatedProxy())
+		if (!CurrentRagdollGoal.IsZero())
 		{
-			if (!BoneVelocity.IsNearlyZero())
+			const FVector RagdollBoneDelta = CurrentRagdollGoal - BoneLocation;
+		
+			if (!IsSimulatedProxy() && (!BoneVelocity.IsNearlyZero() || RagdollBoneDelta.Size() > 2.f))
 			{
-				// Find what the 'ground' is here. We do this on the affected client as well to ensure
-				// a smooth camera.
-				FVector NewLocation = BoneLocation;
+				FVector NewLocation = CurrentRagdollGoal;
 				NewLocation.Z = UpdatedComponent->GetComponentLocation().Z;
+				FCollisionQueryParams CollisionParameters = FCollisionQueryParams(NAME_None, true, GetOwner());
+				CollisionParameters.AddIgnoredComponent(UpdatedPrimitive);
+				
+				FHitResult GroundHit;
+				const FVector StartCheck = CurrentRagdollGoal + FVector(0.f, 0.f, PreviousCollisionHalfHeight);
+				const FVector EndCheck = CurrentRagdollGoal - FVector(0.f, 0.f, 25.f);
+				GetWorld()->LineTraceSingleByChannel(GroundHit, StartCheck, EndCheck, ECC_Pawn, CollisionParameters);
 
-				if (const FHitResult SweepResult =
-					SweepRootCollisionSingleByChannel(
-						FVector::DownVector,
-						FMath::Clamp(BasedMovement.GetMaxHeight(), MIN_ACTOR_BASE_TRACE_LENGTH, UE_BIG_NUMBER),
-						FVector::ZeroVector,
-						FQuat::Identity,
-						UpdatedComponent->GetCollisionObjectType()
-					); SweepResult.bBlockingHit)
+				if (GroundHit.bBlockingHit)
 				{
-					NewLocation.Z = SweepResult.Location.Z;
-				}
-
-				if (NewLocation.Z - BoneLocation.Z > PreviousCollisionHalfHeight)
-				{
-					NewLocation.Z = BoneLocation.Z + PreviousCollisionHalfHeight;
+					NewLocation.Z = FMath::Min(UpdatedComponent->GetComponentLocation().Z, GroundHit.ImpactPoint.Z + PreviousCollisionHalfHeight);
 				}
 				
 				// Move our character to stay with the pelvis. We do this on the client, too, to make the
 				// overall effect smooth.
 				const FVector Delta = NewLocation - UpdatedComponent->GetComponentLocation();
-
-				if (Delta.Size() > 0.5f)
+		
+				if (Delta.Size() > KINDA_SMALL_NUMBER)
 				{
 					FHitResult GroundResult;
-					SafeMoveUpdatedComponent(Delta, UpdatedComponent->GetComponentQuat(), false, GroundResult);
-				}
-			}
-			else if (GetOwnerRole() == ROLE_Authority)
-			{
-				FVector NewLocation = UpdatedComponent->GetComponentLocation();
-				NewLocation.Z = BoneLocation.Z;
-				
-				FHitResult GroundHit;
-				const FVector LineTraceStart = NewLocation;
-				const FVector LineTraceEnd = LineTraceStart + FVector::DownVector * 50.f;
-				FCollisionQueryParams CollisionQueryParams(NAME_None, false, GetOwner());
-				CollisionQueryParams.AddIgnoredActors(UpdatedPrimitive->GetMoveIgnoreActors());
-				CollisionQueryParams.AddIgnoredComponents(UpdatedPrimitive->GetMoveIgnoreComponents());
-				const auto& CollisionResponseParams = UpdatedComponent->GetCollisionResponseToChannels();
-				if (const auto& World = GetWorld())
-				{
-					World->LineTraceSingleByChannel(
-					  GroundHit,
-					  LineTraceStart,
-					  LineTraceEnd,
-					  UpdatedComponent->GetCollisionObjectType(),
-					  CollisionQueryParams,
-					  CollisionResponseParams
-					);
-				}
-
-				if (GroundHit.bBlockingHit)
-				{
-					NewLocation.Z = GroundHit.Location.Z + PreviousCollisionHalfHeight;
-					SafeMoveUpdatedComponent(NewLocation - UpdatedComponent->GetComponentLocation(), UpdatedComponent->GetComponentQuat(), false, GroundHit);
+					SafeMoveUpdatedComponent(NewLocation - UpdatedComponent->GetComponentLocation(), UpdatedComponent->GetComponentQuat(), false, GroundResult, ETeleportType::TeleportPhysics);
 				}
 			}
 		}
+
 		return;
 	}
 
@@ -666,7 +675,7 @@ void UGMCE_OrganicMovementCmp::PhysicsCustom_Implementation(float DeltaSeconds)
 		else
 		{
 			// No valid solver available. Bail.
-			SetMovementMode(EGMC_MovementMode::Airborne);
+			LeaveSolverMode();
 		}
 		return;
 	}
@@ -773,6 +782,19 @@ void UGMCE_OrganicMovementCmp::CalculateVelocity(float DeltaSeconds)
 	}
 }
 
+void UGMCE_OrganicMovementCmp::ApplyDirectionalInput(const FInputActionInstance& InputAction)
+{
+	Super::ApplyDirectionalInput(InputAction);
+}
+
+void UGMCE_OrganicMovementCmp::OnLanded_Implementation(const FVector& ImpactVelocity)
+{
+	Super::OnLanded_Implementation(ImpactVelocity);
+
+	// Store our impact velocity for purposes of animation.
+	LastLandingVelocity = ImpactVelocity;
+}
+
 void UGMCE_OrganicMovementCmp::RotateYawTowardsDirection(const FVector& Direction, float Rate, float DeltaTime)
 {
 	Super::RotateYawTowardsDirection(Direction, Rate, DeltaTime);
@@ -843,6 +865,20 @@ void UGMCE_OrganicMovementCmp::ApplyRotation(bool bIsDirectBotMove,
 	// Otherwise just let GMC handle it as normal.
 	Super::ApplyRotation(bIsDirectBotMove, RootMotionMetaData, DeltaSeconds);
 }
+
+void UGMCE_OrganicMovementCmp::MontageUpdate(float DeltaSeconds)
+{
+	PreviousMontagePosition = MontageTracker.MontagePosition;
+	Super::MontageUpdate(DeltaSeconds);
+}
+
+void UGMCE_OrganicMovementCmp::OnMontageStarted(UAnimMontage* Montage, float Position, float PlayRate,
+                                                bool bInterrupted, float DeltaSeconds)
+{
+	PreviousMontagePosition = Position;
+	Super::OnMontageStarted(Montage, Position, PlayRate, bInterrupted, DeltaSeconds);
+}
+
 #pragma endregion 
 
 #pragma region Animation Support
@@ -856,7 +892,7 @@ void UGMCE_OrganicMovementCmp::PreProcessRootMotion(const FGMC_AnimMontageInstan
 	{
 		InOutRootMotionParams.Set(ProcessRootMotionPreConvertToWorld.Execute(InOutRootMotionParams.GetRootMotionTransform(), this, DeltaSeconds));
 	}
-	
+
 	Super::PreProcessRootMotion(MontageInstance, InOutRootMotionParams, DeltaSeconds);
 }
 
@@ -895,6 +931,19 @@ void UGMCE_OrganicMovementCmp::CalculateAimYawRemaining(const FVector& Direction
 	AimYawRemaining = UKismetMathLibrary::FindRelativeLookAtRotation(GetActorTransform(), GetActorLocation_GMC() + DirectionVector).Yaw;
 }
 
+float UGMCE_OrganicMovementCmp::GetMaxPredictionSpeed(const FVector& InputVector)
+{
+	if (bIgnoreInputModifier)
+	{
+		// Modifier is being ignored.
+		return MaxDesiredSpeed;
+	}
+
+	// Calculate the modified max speed.
+	gmc_ck(MaxDesiredSpeed >= MinAnalogWalkSpeed)
+	return FMath::Clamp(InputVector.Length() * MaxDesiredSpeed, MinAnalogWalkSpeed, BIG_NUMBER);	
+}
+
 #pragma endregion
 
 
@@ -906,6 +955,34 @@ bool UGMCE_OrganicMovementCmp::IsInputPresent(bool bAllowGrace) const
 	}
 
 	return bInputPresent;
+}
+
+void UGMCE_OrganicMovementCmp::UpdateAllPredictions(float DeltaTime)
+{
+	if (bTrajectoryEnabled)
+	{
+		// Track trajectory even when we're in custom movement modes.
+		UpdateMovementSamples();
+	}
+	
+	if (GetMovementMode() == EGMC_MovementMode::Grounded || GetMovementMode() == EGMC_MovementMode::Airborne)
+	{
+		if (GetMovementMode() == EGMC_MovementMode::Grounded)
+		{
+			if (bPrecalculateDistanceMatches)
+			{
+				UpdateStopPrediction(DeltaTime);
+				UpdatePivotPrediction(DeltaTime);
+				UpdateStartPrediction(DeltaTime);
+			}
+		}
+
+		if (bTrajectoryEnabled && bPrecalculateFutureTrajectory)
+		{
+			// Only predict trajectory when we're grounded or in airborne mode.
+			UpdateTrajectoryPrediction();
+		}
+	}
 }
 
 void UGMCE_OrganicMovementCmp::UpdateCalculatedEffectiveAcceleration()
@@ -937,8 +1014,24 @@ void UGMCE_OrganicMovementCmp::UpdatePivotPrediction(float DeltaTime)
 {
 	const FRotator Rotation = GetActorRotation_GMC();
 
-	PredictedPivotPoint = PredictGroundedPivotLocation(GetCurrentEffectiveAcceleration(), GetLinearVelocity_GMC(), Rotation, GroundFriction, DeltaTime, FMath::Clamp(PivotPredictionAngleThreshold, 90.f, 179.f));
+	PredictedPivotPoint = PredictGroundedPivotLocation(GetCurrentEffectiveAcceleration(), GetLinearVelocity_GMC(), Rotation, GroundFriction, DeltaTime, FMath::Clamp(PivotPredictionAngleThreshold, 30.f, 179.f));
 	bTrajectoryIsPivoting = !PredictedPivotPoint.IsZero() && IsInputPresent() && DoInputAndVelocityDiffer();	
+}
+
+void UGMCE_OrganicMovementCmp::UpdateStartPrediction(float DeltaTime)
+{
+	if (GetCurrentAnimationAcceleration().IsZero() && LastStartVelocityCheck.IsZero() && !bTrajectoryIsPivoting && !bLastStoppedPivotCheck)
+	{
+		bTrajectoryIsStarting = false;
+		bLastStoppedPivotCheck = false;
+		LastStoppedTimestamp = GetTime();
+		return;
+	}
+
+	bTrajectoryIsStarting = (GetTime() - LastStoppedTimestamp < 0.2) && !bTrajectoryIsPivoting && !bLastStoppedPivotCheck;
+	bLastStoppedPivotCheck = bTrajectoryIsPivoting;
+	LastStartVelocityCheck = GetLinearVelocity_GMC();
+
 }
 
 bool UGMCE_OrganicMovementCmp::IsStopPredicted(FVector& OutStopPrediction) const
@@ -1031,7 +1124,7 @@ FGMCE_MovementSampleCollection UGMCE_OrganicMovementCmp::GetMovementHistory(bool
 }
 
 FGMCE_MovementSampleCollection UGMCE_OrganicMovementCmp::PredictMovementFuture(const FTransform& FromOrigin,
-	bool bIncludeHistory) const
+	const FRotator& ControllerRotation, const FQuat& MeshOffset, bool bIncludeHistory)
 {
 	const float TimePerSample = 1.f / TrajectorySimSampleRate;
 	const int32 TotalSimulatedSamples = FMath::TruncToInt32(TrajectorySimSampleRate * TrajectorySimSeconds);
@@ -1046,41 +1139,119 @@ FGMCE_MovementSampleCollection UGMCE_OrganicMovementCmp::PredictMovementFuture(c
 	{
 		Predictions.Samples.Append(GetMovementHistory(false).Samples);
 	}
-	Predictions.Samples.Add(GetMovementSampleFromCurrentState());
 
-	FRotator RotationVelocity;
 	FVector PredictedAcceleration;
-	GetCurrentAccelerationRotationVelocityFromHistory(PredictedAcceleration, RotationVelocity);
+	FRotator RotationVelocity;
+	FVector TempVector;
+	
+	GetCurrentAccelerationRotationVelocityFromHistory(PredictedAcceleration, RotationVelocity, EGMCE_TrajectoryRotationType::Component);
+	RotationVelocity = FRotator(0.f, FMath::Clamp(RotationVelocity.Yaw, -RotationRate, RotationRate), 0.f);
 	FRotator RotationVelocityPerSample = RotationVelocity * TimePerSample;
 
-	const float BrakingDeceleration = GetBrakingDeceleration();
-	const float BrakingFriction = GroundFriction;
-	const float MaxSpeed = GetMaxSpeed();
+	FRotator TravelRotation;
+	GetCurrentAccelerationRotationVelocityFromHistory(TempVector, TravelRotation, EGMCE_TrajectoryRotationType::Travel);	
+	
+	FRotator ControllerRotationVelocity;
+	GetCurrentAccelerationRotationVelocityFromHistory(TempVector, ControllerRotationVelocity, EGMCE_TrajectoryRotationType::Controller);
+	FRotator ControllerRotationVelocityPerSample = FRotator(0.f, ControllerRotationVelocity.Yaw, 0.f) * TimePerSample;
+
+	FRotator MeshOffsetRotationVelocity;
+	GetCurrentAccelerationRotationVelocityFromHistory(TempVector, MeshOffsetRotationVelocity, EGMCE_TrajectoryRotationType::MeshOffset);
+	FRotator MeshOffsetRotationVelocityPerSample = FRotator(0.f, MeshOffsetRotationVelocity.Yaw, 0.f) * TimePerSample;
+
+	EGMC_MovementMode EffectiveMovementMode = GetMovementMode();
+	const FVector InputVector = PreProcessInputVector(RawInputVector);
+	PredictedAcceleration = InputVector * GetInputAcceleration();
+	PredictedAcceleration.Z = 0.f;
+
+	FRotator RotationToUse;
+	if (bTrajectoryUsesControllerRotation)
+	{
+		RotationToUse = ControllerRotationVelocity;
+	}
+	else
+	{
+		RotationToUse = TravelRotation;
+	}
+	
+	RotationToUse.Yaw = FMath::Min(RotationToUse.Yaw, RotationRate);
+	FRotator AccelerationRotation = RotationToUse * TimePerSample;
+	
+	float BrakingDeceleration = GetBrakingDeceleration();
+	float BrakingFriction = IsAirborne() ? 1.f : GetGroundFriction();
+	float MaxSpeed = GetMaxPredictionSpeed(InputVector);
 
 	const bool bZeroFriction = BrakingFriction == 0.f;
 	const bool bNoBrakes = BrakingDeceleration == 0.f;
 	
 	FVector CurrentLocation = FromOrigin.GetLocation();
 	FRotator CurrentRotation = FromOrigin.GetRotation().Rotator();
+	FRotator CurrentControllerRotation = ControllerRotation;
+	FRotator CurrentMeshOffsetRotation = MeshOffset.Rotator();
 	FVector CurrentVelocity = GetLinearVelocity_GMC();
+
+	const FVector InitialAccel = PredictedAcceleration;
+	const FVector InitialVel = CurrentVelocity;
+	FVector Deceleration;
+	float DistanceTraveled = 0.f;
+	int SampleCount = 0;
 
 	for (int32 Idx = 0; Idx < TotalSimulatedSamples; Idx++)
 	{
 		if (!RotationVelocityPerSample.IsNearlyZero())
 		{
-			PredictedAcceleration = RotationVelocityPerSample.RotateVector(PredictedAcceleration);
 			CurrentRotation += RotationVelocityPerSample;
 			RotationVelocityPerSample.Yaw /= 1.1f;
 		}
+		if (!ControllerRotationVelocityPerSample.IsNearlyZero())
+		{
+			CurrentControllerRotation += ControllerRotationVelocityPerSample;
+			ControllerRotationVelocityPerSample.Yaw /= 1.1f;
+		}
+		if (!CurrentMeshOffsetRotation.IsNearlyZero())
+		{
+			CurrentMeshOffsetRotation += MeshOffsetRotationVelocityPerSample;
+			MeshOffsetRotationVelocityPerSample.Yaw /= 1.1f;
+		}
 
+		if (EffectiveMovementMode == EGMC_MovementMode::Airborne)
+		{
+			// *singing a'la Idina Menzel* I guess I'm not... defying gravity.. 
+			CurrentVelocity += GetGravity() * TimePerSample;
+		}
+		
+		const float DecelerationScale = FMath::Clamp(1.f - (PredictedAcceleration.GetSafeNormal() | CurrentVelocity.GetSafeNormal()), 0.f, 1.f);
+		Deceleration = GetBrakingDeceleration() * DecelerationScale * -CurrentVelocity.GetSafeNormal() * BrakingFriction;
+
+		if (EffectiveMovementMode == EGMC_MovementMode::Airborne && Deceleration.Z < 0.f)
+		{
+			// Don't decelerate against gravity...
+			Deceleration.Z = 0.f;
+		}
+
+		FVector PreviousAcceleration = PredictedAcceleration;
+		if (!Deceleration.IsZero() && (EffectiveMovementMode == EGMC_MovementMode::Airborne || !IsInputPresent()))
+		{
+			Deceleration = ClampToMinDeceleration(Deceleration);
+			PredictedAcceleration += Deceleration;
+		}
+
+		if (DirectionsDifferXY(PreviousAcceleration, PredictedAcceleration))
+		{
+			PredictedAcceleration = FVector(0.f, 0.f, PredictedAcceleration.Z);
+		}
+		if (DirectionsDifferZ(PreviousAcceleration, PredictedAcceleration))
+		{
+			PredictedAcceleration = FVector(PredictedAcceleration.X, PredictedAcceleration.Y, 0.f);
+		}
+		
+		const FVector PreviousVelocity = CurrentVelocity;
+		
 		if (PredictedAcceleration.IsNearlyZero())
 		{
 			if (!CurrentVelocity.IsNearlyZero())
 			{
-				const FVector Deceleration = bNoBrakes ? FVector::ZeroVector : -BrakingDeceleration * CurrentVelocity.GetSafeNormal();
-
 				constexpr float MaxPredictedTrajectoryTimeStep = 1.f / 33.f;
-				const FVector PreviousVelocity = CurrentVelocity;
 
 				float RemainingTime = TimePerSample;
 				while (RemainingTime >= 1e-6f && !CurrentVelocity.IsZero())
@@ -1089,7 +1260,7 @@ FGMCE_MovementSampleCollection UGMCE_OrganicMovementCmp::PredictMovementFuture(c
 						FMath::Min(MaxPredictedTrajectoryTimeStep, RemainingTime * 0.5f) : RemainingTime;
 					RemainingTime -= dt;
 
-					CurrentVelocity = CurrentVelocity + (-BrakingFriction * CurrentVelocity + Deceleration) * dt;
+					CurrentVelocity = CurrentVelocity + (Deceleration * dt);
 					if ((CurrentVelocity | PreviousVelocity) < 0.f)
 					{
 						CurrentVelocity = FVector::ZeroVector;
@@ -1116,22 +1287,113 @@ FGMCE_MovementSampleCollection UGMCE_OrganicMovementCmp::PredictMovementFuture(c
 				(BrakingFriction * TimePerSample);
 
 			CurrentVelocity += PredictedAcceleration * TimePerSample;
-			CurrentVelocity = CurrentVelocity.GetClampedToMaxSize(MaxSpeed);
+
+			CurrentVelocity = CurrentVelocity.GetClampedToMaxSize2D(MaxSpeed);
 		}
 
+		if (EffectiveMovementMode == EGMC_MovementMode::Grounded && CurrentVelocity.Z < MaxGroundedVelocityZ)
+		{
+			// Stick to the ground if we're not exceeding the max grounded velocity.
+			// If we're predicting collisions anyway, we'll adapt to a slope if needed.
+			CurrentVelocity.Z = 0.f;
+		}
+
+		const FVector PreviousLocation = CurrentLocation;
 		CurrentLocation += CurrentVelocity * TimePerSample;
-		
+		bool bUseAsMark = false;
+
+		const float PredictedDrop = CurrentVelocity.Z * TimePerSample;
+
+		if (bTrajectoryPredictCollisions)
+		{
+			FVector Start = CurrentLocation + FVector::UpVector * GetMaxStepUpHeight();
+			FVector End = CurrentLocation - FVector::UpVector * (EffectiveMovementMode == EGMC_MovementMode::Grounded ? GetMaxStepDownHeight() : PredictedDrop);
+
+			FHitResult Hit;
+			UKismetSystemLibrary::LineTraceSingle(this, Start, End,
+				UEngineTypes::ConvertToTraceType(ECC_Visibility), false, { },
+				EDrawDebugTrace::None, Hit, true);
+			
+			if (!Hit.bStartPenetrating)
+			{
+				if (Hit.bBlockingHit && (FMath::Abs(Hit.Location.Z - CurrentLocation.Z) > 2.f))
+				{
+					CurrentLocation = Hit.Location;
+					// CurrentVelocity.Z = (CurrentLocation.Z - PreviousLocation.Z) / TimePerSample;
+				}
+
+				if (EffectiveMovementMode == EGMC_MovementMode::Grounded && !Hit.bBlockingHit)
+				{
+					// Handle transition to falling.
+					EffectiveMovementMode = EGMC_MovementMode::Airborne;
+					PredictedAcceleration = FVector::ZeroVector;
+					BrakingDeceleration = BrakingDecelerationAirborne;
+					BrakingFriction = 1.f;
+					bUseAsMark = true;
+				}
+			
+				if (EffectiveMovementMode == EGMC_MovementMode::Airborne && Hit.bBlockingHit)
+				{
+					// Handle transition to ground
+					EffectiveMovementMode = EGMC_MovementMode::Grounded;
+					CurrentVelocity.Z = 0.f;
+					PredictedAcceleration = InitialAccel;
+					PredictedAcceleration = PredictedAcceleration.GetClampedToMaxSize(GetInputAcceleration());
+					PredictedAcceleration.Z = 0.f;
+					BrakingDeceleration = BrakingDecelerationGrounded;
+					BrakingFriction = GetGroundFriction();
+					bUseAsMark = true;
+				}				
+			}
+		}
+
 		const FTransform NewTransform = FTransform(CurrentRotation.Quaternion(), CurrentLocation);
 		const FTransform NewRelativeTransform = NewTransform.GetRelativeTransform(FromOrigin);
 
+		const FRotator FacingRotation = NewTransform.GetRotation().Rotator() - MeshOffset.Rotator();
+
+		const FTransform ActorTransform = FTransform(FacingRotation, CurrentLocation);
+
+		DistanceTraveled += (CurrentLocation - PreviousLocation).Size();
+		
 		SimulatedSample = FGMCE_MovementSample();
 		SimulatedSample.RelativeTransform = NewRelativeTransform;
 		SimulatedSample.RelativeLinearVelocity = FromOrigin.InverseTransformVectorNoScale(CurrentVelocity);
 		SimulatedSample.WorldTransform = NewTransform;
 		SimulatedSample.WorldLinearVelocity = CurrentVelocity;
 		SimulatedSample.AccumulatedSeconds = TimePerSample * (Idx + 1);
+		SimulatedSample.ControllerRotation = CurrentControllerRotation;
+		SimulatedSample.MeshComponentRelativeRotation = CurrentMeshOffsetRotation.Quaternion();
+		SimulatedSample.ActorWorldTransform = ActorTransform;
+		SimulatedSample.ActorWorldRotation = ActorTransform.GetRotation().Rotator();
+		SimulatedSample.Acceleration = PredictedAcceleration;
+		SimulatedSample.bUseAsMarker = bUseAsMark;
 
 		Predictions.Samples.Emplace(SimulatedSample);
+
+		SampleCount++;
+
+		if (bTrajectoryUsesControllerRotation && bTrajectoryStopsAtControllerRotation)
+		{
+			float ControllerYawDelta = FMath::Abs(FRotator::NormalizeAxis(GetControllerRotation_GMC().Yaw) - FRotator::NormalizeAxis(ControllerRotation.Yaw));
+			if (ControllerYawDelta <= 0.5f)
+			{
+				AccelerationRotation = FRotator::ZeroRotator;
+				ControllerRotationVelocityPerSample = FRotator::ZeroRotator;
+			}
+		}
+		
+		// Rotate acceleration at the end, so we can handle deceleration in a sane fashion.
+		if (!AccelerationRotation.IsNearlyZero())
+		{
+			PredictedAcceleration = AccelerationRotation.RotateVector(PredictedAcceleration);
+			if (!bTrajectoryUsesControllerRotation || !bTrajectoryStopsAtControllerRotation)
+			{
+				// If we use controller rotation, we stop when we're near our current rotation.
+				// If we're using velocity rotation, we need to decay our rotation a bit.
+				AccelerationRotation.Yaw /= TrajectoryRotationDecay ? TrajectoryRotationDecay : 1.1f;
+			}
+		}
 	}
 
 	return Predictions;	
@@ -1140,15 +1402,18 @@ FGMCE_MovementSampleCollection UGMCE_OrganicMovementCmp::PredictMovementFuture(c
 void UGMCE_OrganicMovementCmp::UpdateTrajectoryPrediction()
 {
 	FTransform OriginTransform;
-	if (bTrajectoryUsesMesh)
+	FQuat MeshOffsetRotation;
+	if (bTrajectoryUsesMesh && IsValid(SkeletalMesh))
 	{
 		OriginTransform = SkeletalMesh->GetComponentTransform();
+		MeshOffsetRotation = SkeletalMesh->GetRelativeRotation().Quaternion();
 	}
 	else
 	{
 		OriginTransform = UpdatedComponent->GetComponentTransform();
+		MeshOffsetRotation = FQuat::Identity;
 	}
-	PredictedTrajectory = PredictMovementFuture(OriginTransform, true);	
+	PredictedTrajectory = PredictMovementFuture(OriginTransform, FRotator(0.f, GetControllerRotation_GMC().Yaw, 0.f), MeshOffsetRotation, true);	
 }
 
 FGMCE_MovementSample UGMCE_OrganicMovementCmp::GetMovementSampleFromCurrentState() const
@@ -1158,19 +1423,30 @@ FGMCE_MovementSample UGMCE_OrganicMovementCmp::GetMovementSampleFromCurrentState
 	// CurrentTransform.SetLocation(CurrentLocation);
 
 	FTransform CurrentTransform;
-	if (bTrajectoryUsesMesh)
+	FQuat MeshRelativeRotation = FQuat::Identity;
+	if (bTrajectoryUsesMesh && IsValid(SkeletalMesh))
 	{
 		CurrentTransform = SkeletalMesh->GetComponentTransform();
+		MeshRelativeRotation = SkeletalMesh->GetRelativeRotation().Quaternion();
 	}
 	else
 	{
+		if (bTrajectoryUsesMesh)
+		{
+			// We are only here if Skeletal Mesh is null.
+			UE_LOG(LogGMCExtended, Warning, TEXT("%s has no skeletal mesh but bTrajectoryUsesMesh is true. Reverting to using collision capsule for trajectory."), *GetName())
+		}
 		CurrentTransform = GetPawnOwner()->GetActorTransform();
 		const FVector CurrentLocation = GetLowerBound();
 		CurrentTransform.SetLocation(CurrentLocation);
 	}
 
 	FGMCE_MovementSample Result = FGMCE_MovementSample(CurrentTransform, GetLinearVelocity_GMC());
+	Result.ActorWorldTransform = GetPawnOwner()->GetActorTransform();
 	Result.ActorWorldRotation = GetPawnOwner()->GetActorRotation();
+	Result.MeshComponentRelativeRotation = MeshRelativeRotation;
+	Result.ControllerRotation = FRotator(0.f, GetControllerRotation_GMC().Yaw, 0.f);
+	Result.Acceleration = GetProcessedInputVector();
 	if (!LastMovementSample.IsZeroSample())
 	{
 		Result.ActorDeltaRotation = Result.ActorWorldRotation - LastMovementSample.ActorWorldRotation;
@@ -1249,14 +1525,16 @@ void UGMCE_OrganicMovementCmp::CullMovementSampleHistory(bool bIsNearlyZero, con
 void UGMCE_OrganicMovementCmp::UpdateMovementSamples_Implementation()
 {
 	const float GameSeconds = UKismetSystemLibrary::GetGameTimeInSeconds(GetWorld());
-	if (GameSeconds - LastTrajectoryGameSeconds > SMALL_NUMBER)
+	const float Period = TrajectoryHistoryPeriod ? TrajectoryHistoryPeriod : SMALL_NUMBER;
+	
+	if (GameSeconds - LastTrajectoryGameSeconds > Period)
 	{
 		AddNewMovementSample(GetMovementSampleFromCurrentState());
 	}		
 }
 
 void UGMCE_OrganicMovementCmp::GetCurrentAccelerationRotationVelocityFromHistory(FVector& OutAcceleration,
-	FRotator& OutRotationVelocity) const
+	FRotator& OutRotationVelocity, const EGMCE_TrajectoryRotationType& RotationType) const
 {
 	const auto HistoryArray = MovementSamples;
 	if (HistoryArray.IsEmpty())
@@ -1270,13 +1548,38 @@ void UGMCE_OrganicMovementCmp::GetCurrentAccelerationRotationVelocityFromHistory
 	{
 		const FGMCE_MovementSample Sample = HistoryArray[Idx];
 
-		if (LastMovementSample.AccumulatedSeconds - Sample.AccumulatedSeconds >= 0.01f)
+		if (LastMovementSample.AccumulatedSeconds - Sample.AccumulatedSeconds >= 0.1f)
 		{
-			OutRotationVelocity = LastMovementSample.GetRotationVelocityFrom(Sample);
+			OutRotationVelocity = LastMovementSample.GetRotationVelocityFrom(Sample, RotationType);
 			OutAcceleration = LastMovementSample.GetAccelerationFrom(Sample);
 			return;
 		}
-	}		
+	}
+
+	OutRotationVelocity = FRotator::ZeroRotator;
+	OutAcceleration = FVector::ZeroVector;
+}
+
+FVector UGMCE_OrganicMovementCmp::GetCurrentVelocityFromHistory()
+{
+	const auto HistoryArray = MovementSamples;
+	if (HistoryArray.IsEmpty())
+	{
+		return FVector::ZeroVector;
+	}
+	
+	for (int32 Idx = HistoryArray.Num() - 1; Idx >= 0; Idx--)
+	{
+		const FGMCE_MovementSample Sample = HistoryArray[Idx];
+		float TimeDelta = LastMovementSample.AccumulatedSeconds - Sample.AccumulatedSeconds;
+		
+		if (TimeDelta >= 0.1f)
+		{
+			return (LastMovementSample.WorldTransform.GetLocation() - Sample.WorldTransform.GetLocation()) / TimeDelta;
+		}
+	}
+
+	return FVector::ZeroVector;
 }
 
 void UGMCE_OrganicMovementCmp::EnableRagdoll()
@@ -1307,10 +1610,22 @@ void UGMCE_OrganicMovementCmp::SetRagdollActive(bool bActive)
 		}
 		HaltMovement();
 	}
+	else
+	{
+		CurrentRagdollGoal = FVector::ZeroVector;
+		bRagdollStopped = true;
+	}
 
 	bEnablePhysicsInteraction = !bActive;
 	bFirstRagdollTick = bActive;
 	bResetMesh = !bActive;
+}
+
+bool UGMCE_OrganicMovementCmp::IsRagdollBoneAuthority() const
+{
+	// return GetNetMode() == NM_Standalone || GetOwnerRole() == ROLE_AutonomousProxy || IsLocallyControlledListenServerPawn();
+
+	return GetNetMode() == NM_Standalone || GetOwnerRole() == ROLE_Authority;
 }
 
 void UGMCE_OrganicMovementCmp::RunSolvers(float DeltaTime)
@@ -1322,7 +1637,7 @@ void UGMCE_OrganicMovementCmp::RunSolvers(float DeltaTime)
 	{
 		if (Solver->RunSolver(State, DeltaTime))
 		{
-			// ???
+			
 		}
 	}
 
@@ -1422,6 +1737,25 @@ FSolverState UGMCE_OrganicMovementCmp::GetSolverState() const
 	State.AvailableSolvers = AvailableSolvers;
 
 	return State;	
+}
+
+void UGMCE_OrganicMovementCmp::LeaveSolverMode()
+{
+	FHitResult HitCheck;
+	FCollisionQueryParams CollisionQueryParams(NAME_None, false, GetOwner());
+	CollisionQueryParams.AddIgnoredActors(UpdatedPrimitive->GetMoveIgnoreActors());
+	CollisionQueryParams.AddIgnoredComponents(UpdatedPrimitive->GetMoveIgnoreComponents());
+	GetWorld()->LineTraceSingleByChannel(HitCheck, GetLowerBound() + FVector(0.f, 0.f, MaxStepUpHeight),
+										 GetLowerBound() - FVector(0.f, 0.f, MaxStepDownHeight),
+										 ECC_Pawn, FCollisionQueryParams(NAME_None, true, GetOwner()));
+	if (HitWalkableFloor(HitCheck))
+	{
+		SetMovementMode(EGMC_MovementMode::Grounded);
+	}
+	else
+	{
+		SetMovementMode(EGMC_MovementMode::Airborne);
+	}
 }
 
 
@@ -1685,3 +2019,69 @@ bool UGMCE_OrganicMovementCmp::IsTrajectoryDebugEnabled() const
 	return false;
 #endif	
 }
+
+
+#pragma region Buoyancy Extended
+
+// GMC Override
+
+void UGMCE_OrganicMovementCmp::UpdateImmersionDepth()
+{
+	CurrentImmersionDepth = CALL_NATIVE_EVENT_CONDITIONAL(bNoBlueprintEvents, this, ComputeCustomImmersionDepth);
+}
+
+float UGMCE_OrganicMovementCmp::Swim(const FVector& LocationDelta, FHitResult& OutHit, FGMC_FloorParams& Floor, float DeltaSeconds)
+{
+	gmc_ck(BuoyantStateMinImmersion >= UE_KINDA_SMALL_NUMBER)
+
+	const FVector StartLocation = UpdatedComponent->GetComponentLocation();
+	float TimeOutOfWater = 0.f;
+
+	if (SafeMoveUpdatedComponent(LocationDelta, UpdatedComponent->GetComponentQuat(), true, OutHit))
+	{
+		UpdateImmersionDepth();
+	}
+
+	if (CurrentImmersionDepth < BuoyantStateMinImmersion)
+	{
+		// Pawn has left the water volume.
+		const FVector CurrentLocation = UpdatedComponent->GetComponentLocation();
+		FVector WaterLine = CALL_NATIVE_EVENT_CONDITIONAL(bNoBlueprintEvents, this, FindCustomWaterLine, StartLocation, CurrentLocation, CurrentImmersionDepth);
+
+		// Adjust the water line according to the configured min immersion depth.
+		if (!FMath::IsNearlyEqual(BuoyantStateMinImmersion, 0.5f, UE_KINDA_SMALL_NUMBER))
+		{
+			const FVector TraveledInWater = WaterLine - StartLocation;
+			WaterLine = StartLocation + (1.5f - BuoyantStateMinImmersion) * TraveledInWater;
+		}
+
+		const float DesiredDistance = LocationDelta.Size();
+		if (!WaterLine.Equals(CurrentLocation) && DesiredDistance > UE_KINDA_SMALL_NUMBER)
+		{
+			const float DistanceOutOfWater = (CurrentLocation - WaterLine).Size();
+			// For the rare case that the pawn leaves the water volume from the side the water line may not have been calculated correctly.
+			if (DesiredDistance > DistanceOutOfWater)
+			{
+				TimeOutOfWater = DistanceOutOfWater / DesiredDistance;
+				// Move us back to the water line. We shouldn't hit anything on the way back because the was no collision before either.
+				MoveUpdatedComponent(WaterLine - CurrentLocation, UpdatedComponent->GetComponentQuat(), false);
+			}
+		}
+	}
+
+	return TimeOutOfWater;
+}
+
+// End GMC Override
+
+float UGMCE_OrganicMovementCmp::ComputeCustomImmersionDepth_Implementation()
+{
+	return ComputeImmersionDepth();
+}
+
+FVector UGMCE_OrganicMovementCmp::FindCustomWaterLine_Implementation(const FVector& LocationInWater, const FVector& LocationOutOfWater, float ImmersionDepth)
+{
+	return FindWaterLine(LocationInWater, LocationOutOfWater, ImmersionDepth);
+}
+
+#pragma endregion

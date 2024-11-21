@@ -2,6 +2,7 @@
 #include "Animation/AnimNotifyState_GMCExMotionWarp.h"
 #include "GMCExtendedAnimation.h"
 #include "GMCExtendedAnimationLog.h"
+#include "GMCE_MotionWarpingUtilities.h"
 #include "GMCE_MotionWarpTarget.h"
 #include "GMCE_RootMotionModifier_SkewWarp.h"
 #include "GMCE_RootMotionModifier_Warp.h"
@@ -132,6 +133,7 @@ void UGMCE_MotionWarpingComponent::Update(float DeltaSeconds)
 	FGMCE_MotionWarpContext Context;
 	Context.DeltaSeconds = DeltaSeconds;
 	UGMCE_OrganicMovementCmp *Component = GetMovementComponent();
+	FGMC_MontageTracker& Tracker = Component->MontageTracker;
 	check(Component);
 
 	if (FAnimMontageInstance* RootMotionMontageInstance = MotionWarpSubject->GetRootMotionAnimMontageInstance(MotionWarpSubject->MotionWarping_GetMeshComponent()))
@@ -140,10 +142,55 @@ void UGMCE_MotionWarpingComponent::Update(float DeltaSeconds)
 		check(Montage);
 
 		Context.Animation = Montage;
-		Context.CurrentPosition = RootMotionMontageInstance->GetPosition();
-		Context.PreviousPosition = RootMotionMontageInstance->GetPreviousPosition();
 		Context.Weight = RootMotionMontageInstance->GetWeight();
-		Context.PlayRate = RootMotionMontageInstance->GetPlayRate();
+
+		if (FGMCE_MotionWarpCvars::CVarMotionWarpingFromTracker.GetValueOnGameThread())
+		{
+			Context.CurrentPosition = Tracker.MontagePosition;
+			Context.PreviousPosition = Component->PreviousMontagePosition;
+			Context.PlayRate = Tracker.MontagePlayRate;
+		}
+		else
+		{
+			Context.CurrentPosition = RootMotionMontageInstance->GetPosition();
+			Context.PreviousPosition = RootMotionMontageInstance->GetPreviousPosition();
+			Context.PlayRate = RootMotionMontageInstance->GetPlayRate();
+		}
+		
+		// Read our values from our montage tracker
+
+		const float ExpectedDelta = Context.DeltaSeconds * Context.PlayRate;
+		const float ActualDelta = Context.CurrentPosition - Context.PreviousPosition;
+
+		if (!FMath::IsNearlyZero(FMath::Abs(ActualDelta - ExpectedDelta), UE_KINDA_SMALL_NUMBER) && Modifiers.Num() > 0)
+		{
+			bool bRelevantCorrections = false;
+
+			for (const auto& Modifier : Modifiers)
+			{
+				bRelevantCorrections = bRelevantCorrections || Modifier->IsPositionWithinWindow(Context.PreviousPosition) || Modifier->IsPositionWithinWindow(Context.CurrentPosition);
+			}
+
+			if (bRelevantCorrections)
+			{
+				// Our position has passed out of one or more warping windows; cheat and correct our effective delta seconds to match.
+				Context.DeltaSeconds = (Context.CurrentPosition - Context.PreviousPosition) / Context.PlayRate;
+
+				UE_LOG(LogGMCExAnimation, Verbose, TEXT("Motion Warping: position delta exceeds expected, shifting delta seconds from %f to %f. %s"),
+					DeltaSeconds, Context.DeltaSeconds, *GetOwner()->GetName())
+
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+				const int32 DebugLevel = FGMCE_MotionWarpCvars::CVarMotionWarpingDebug.GetValueOnGameThread();
+				if (DebugLevel >= 2)
+				{
+					const float DrawDebugDuration = FGMCE_MotionWarpCvars::CVarMotionWarpingDrawDebugDuration.GetValueOnGameThread();
+					DrawDebugCapsule(GetWorld(), GetOwner()->GetActorLocation(), GetMovementComponent()->GetRootCollisionHalfHeight(true),
+						GetMovementComponent()->GetRootCollisionWidth(FVector::ForwardVector), GetOwner()->GetActorQuat(),
+						FColor::Red, false, DrawDebugDuration, 0, 1.f);
+				}
+#endif
+			}
+		}
 	}
 
 	if (Context.Animation.IsValid())
@@ -247,7 +294,12 @@ void UGMCE_MotionWarpingComponent::BeginPlay()
 	
 	OwningPawn = Cast<AGMC_Pawn>(GetOwner());
 	MotionWarpSubject = Cast<IGMCE_MotionWarpSubject>(OwningPawn);
-	if (MotionWarpSubject)
+	BindToMovementComponent();
+}
+
+void UGMCE_MotionWarpingComponent::BindToMovementComponent()
+{
+	if (MotionWarpSubject && !MovementComponent)
 	{
 		MovementComponent = MotionWarpSubject->GetGMCExMovementComponent();
 		if (!MovementComponent)
@@ -261,12 +313,25 @@ void UGMCE_MotionWarpingComponent::BeginPlay()
 		{
 			MovementComponent->ProcessRootMotionPreConvertToWorld.BindUObject(this, &UGMCE_MotionWarpingComponent::ProcessRootMotion);
 		}
-	}
+	}	
+}
+
+void UGMCE_MotionWarpingComponent::GetLastRootMotionStep(FTransform& OutLastDelta, float &OutLastDeltaTime)
+{
+	OutLastDelta = GetMovementComponent()->GetSkeletalMeshReference()->ConvertLocalRootMotionToWorld(LastRootTransform);
+	OutLastDeltaTime = LastDeltaTime;
 }
 
 FTransform UGMCE_MotionWarpingComponent::ProcessRootMotion(const FTransform& InTransform,
                                                            UGMCE_OrganicMovementCmp* GMCMovementComponent, float DeltaSeconds)
 {
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+	if (FGMCE_MotionWarpCvars::CVarMotionWarpingDisable.GetValueOnGameThread() > 0)
+	{
+		return InTransform;
+	}
+#endif
+	
 	MotionWarpSubject->MotionWarping_GetMeshComponent()->GetAnimInstance();
 	
 	// Check for warping windows and update modifier states
@@ -282,6 +347,54 @@ FTransform UGMCE_MotionWarpingComponent::ProcessRootMotion(const FTransform& InT
 			FinalRootMotion = Modifier->ProcessRootMotion(FinalRootMotion, DeltaSeconds);
 		}
 	}
+
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+	USkeletalMeshComponent* MeshCmp = GMCMovementComponent->GetSkeletalMeshReference();
+	const int32 DebugLevel = FGMCE_MotionWarpCvars::CVarMotionWarpingDebug.GetValueOnGameThread();
+	const float DrawDebugDuration = FGMCE_MotionWarpCvars::CVarMotionWarpingDrawDebugDuration.GetValueOnGameThread();
+	if (DebugLevel >= 2 && IsValid(MeshCmp))
+	{
+		const float PointSize = 7.f;
+		const FVector ActorFeetLocation = GMCMovementComponent->GetLowerBound();
+		if (Modifiers.Num() > 0)
+		{
+			if (!OriginalRootMotionAccum.IsSet())
+			{
+				OriginalRootMotionAccum = ActorFeetLocation;
+				WarpedRootMotionAccum = ActorFeetLocation;
+			}
+			const FVector OldOriginal = OriginalRootMotionAccum.GetValue();
+			const FVector OldWarped = WarpedRootMotionAccum.GetValue();
+
+			OriginalRootMotionAccum = OriginalRootMotionAccum.GetValue() + (MeshCmp->ConvertLocalRootMotionToWorld(FTransform(InTransform.GetLocation()))).GetLocation();
+			WarpedRootMotionAccum = WarpedRootMotionAccum.GetValue() + (MeshCmp->ConvertLocalRootMotionToWorld(FTransform(FinalRootMotion.GetLocation()))).GetLocation();
+			
+			DrawDebugPoint(GetWorld(), OriginalRootMotionAccum.GetValue(), PointSize, FColor::Red, false, DrawDebugDuration, SDPG_World);
+			DrawDebugLine(GetWorld(), OldOriginal, OriginalRootMotionAccum.GetValue(), FColor::Red, false, DrawDebugDuration, SDPG_World);
+			
+			DrawDebugPoint(GetWorld(), WarpedRootMotionAccum.GetValue(), PointSize, FColor::Green, false, DrawDebugDuration, SDPG_World);
+			DrawDebugLine(GetWorld(), OldWarped, WarpedRootMotionAccum.GetValue(), FColor::Green, false, DrawDebugDuration, SDPG_World);
+		}
+		else
+		{
+			OriginalRootMotionAccum.Reset();
+			WarpedRootMotionAccum.Reset();
+		}
+
+		DrawDebugPoint(GetWorld(), ActorFeetLocation, PointSize, FColor::Blue, false, DrawDebugDuration, SDPG_World);
+	}
+
+	if (DebugLevel >= 4)
+	{
+		for (const auto& Target : WarpTargetContainerInstance.Get<FGMCE_MotionWarpTargetContainer>().GetTargets())
+		{
+			DrawDebugSphere(GetWorld(), Target.GetLocation(), 8.f, 12, FColor::Yellow, false, 1.f, 0, 1.f);
+		}
+	}
+#endif
+
+	LastRootTransform = FinalRootMotion;
+	LastDeltaTime = DeltaSeconds;
 
 	return FinalRootMotion;
 }
